@@ -9,14 +9,14 @@
 //! [`AMidiOutputPort`]: https://developer.android.com/ndk/reference/group/midi#amidioutputport
 #![cfg(feature = "midi")]
 
-pub mod safe;
-
 use super::media_error::{construct, MediaError, Result};
 
 use std::fmt;
-use std::marker::PhantomData;
+use std::mem::{ManuallyDrop, MaybeUninit};
+use std::ops::Deref;
 use std::os::raw::{c_int, c_uint};
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
+use std::sync::Arc;
 
 /// Result of [`MidiOutputPort::receive()`].
 #[derive(Copy, Clone, Debug)]
@@ -83,14 +83,14 @@ impl From<MidiDeviceType> for u32 {
     }
 }
 
-/// A wrapper over [`ffi::AMidiDevice`]. Note that [`MidiDevice`] is intentionally `!Send` and
-/// `!Sync`; please use [`safe::SafeMidiDevice`] if you need the thread-safe version.
+/// A thin wrapper over [`ffi::AMidiDevice`]. Please use [`MidiDevice`] if you need the thread-safe
+/// version.
 #[derive(Debug)]
-pub struct MidiDevice {
+pub struct UnsafeMidiDevice {
     ptr: NonNull<ffi::AMidiDevice>,
 }
 
-impl MidiDevice {
+impl UnsafeMidiDevice {
     /// Assumes ownership of `ptr`
     ///
     /// # Safety
@@ -106,7 +106,7 @@ impl MidiDevice {
 
     /// Connects a native Midi Device object to the associated Java MidiDevice object.
     ///
-    /// Use the returned [`MidiDevice`] to access the rest of the native MIDI API.
+    /// Use the returned [`UnsafeMidiDevice`] to access the rest of the native MIDI API.
     ///
     /// # Safety
     /// `env` and `midi_device_obj` must be valid pointers to a [`jni_sys::JNIEnv`] instance and a
@@ -116,7 +116,7 @@ impl MidiDevice {
     pub unsafe fn from_java(
         env: *mut jni_sys::JNIEnv,
         midi_device_obj: jni_sys::jobject,
-    ) -> Result<MidiDevice> {
+    ) -> Result<UnsafeMidiDevice> {
         unsafe {
             let ptr = construct(|res| ffi::AMidiDevice_fromJava(env, midi_device_obj, res))?;
             Ok(Self::from_ptr(NonNull::new_unchecked(ptr)))
@@ -156,64 +156,217 @@ impl MidiDevice {
         }
     }
 
-    /// Opens the input port so that the client can send data to it. Note that the returned
-    /// [`MidiInputPort`] is intentionally `!Send` and `!Sync`; please use
-    /// [`safe::SafeMidiDevice::open_safe_input_port()`] if you need the thread-safe version.
-    pub fn open_input_port(&self, port_number: i32) -> Result<MidiInputPort<'_>> {
+    /// Opens the input port so that the client can send data to it.
+    pub fn open_input_port(&self, port_number: i32) -> Result<NonNull<ffi::AMidiInputPort>> {
         unsafe {
             let input_port =
                 construct(|res| ffi::AMidiInputPort_open(self.ptr.as_ptr(), port_number, res))?;
-            Ok(MidiInputPort::from_ptr(NonNull::new_unchecked(input_port)))
+            Ok(NonNull::new_unchecked(input_port))
         }
     }
 
-    /// Opens the output port so that the client can receive data from it. Note that the returned
-    /// [`MidiOutputPort`] is intentionally `!Send` and `!Sync`; please use
-    /// [`safe::SafeMidiDevice::open_safe_output_port()`] if you need the thread-safe version.
-    pub fn open_output_port(&self, port_number: i32) -> Result<MidiOutputPort<'_>> {
+    /// Opens the output port so that the client can receive data from it.
+    pub fn open_output_port(&self, port_number: i32) -> Result<NonNull<ffi::AMidiOutputPort>> {
         unsafe {
             let output_port =
                 construct(|res| ffi::AMidiOutputPort_open(self.ptr.as_ptr(), port_number, res))?;
-            Ok(MidiOutputPort::from_ptr(NonNull::new_unchecked(
-                output_port,
-            )))
+            Ok(NonNull::new_unchecked(output_port))
         }
     }
 }
 
-impl Drop for MidiDevice {
+impl Drop for UnsafeMidiDevice {
     fn drop(&mut self) {
         let status = unsafe { ffi::AMidiDevice_release(self.ptr.as_ptr()) };
         MediaError::from_status(status).unwrap();
     }
 }
 
-/// A wrapper over [`ffi::AMidiInputPort`]. Note that [`MidiInputPort`] is intentionally `!Send` and
-/// `!Sync`; please use [`safe::SafeMidiDevice::open_safe_input_port()`] if you need the thread-safe
-/// version.
-pub struct MidiInputPort<'a> {
-    ptr: NonNull<ffi::AMidiInputPort>,
-    _marker: PhantomData<&'a MidiDevice>,
+/// The owner of [`MidiDevice`]. [`MidiDevice`], [`MidiInputPort`], and
+/// [`MidiOutputPort`] holds an [`Arc<MidiDeviceGuard>`]. to ensure that the underlying
+/// [`MidiDevice`] is not dropped while the safe wrappers are alive.
+///
+/// [`MidiDeviceGuard`] also holds a pointer to the current Java VM to attach the calling thread
+/// of [`MidiDeviceGuard::drop()`] to the VM, which is required by [`ffi::AMidiDevice_release()`].
+struct MidiDeviceGuard {
+    midi_device: ManuallyDrop<UnsafeMidiDevice>,
+    java_vm: NonNull<jni_sys::JavaVM>,
 }
 
-impl<'a> fmt::Debug for MidiInputPort<'a> {
+// SAFETY: [`MidiDeviceGuard::drop()`] attaches the calling thread to the Java VM if required.
+unsafe impl Send for MidiDeviceGuard {}
+
+// SAFETY: [`MidiDeviceGuard::drop()`] attaches the calling thread to the Java VM if required.
+unsafe impl Sync for MidiDeviceGuard {}
+
+impl Drop for MidiDeviceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let java_vm_functions = self.java_vm.as_mut().as_ref().unwrap_unchecked();
+            let java_vm = self.java_vm.as_ptr();
+            let mut current_thread_was_attached = true;
+            let mut env = MaybeUninit::uninit();
+
+            // Try to get the current thread's JNIEnv
+            if (java_vm_functions.GetEnv.unwrap_unchecked())(
+                java_vm,
+                env.as_mut_ptr(),
+                jni_sys::JNI_VERSION_1_6,
+            ) != jni_sys::JNI_OK
+            {
+                // Current thread is not attached to the Java VM. Try to attach.
+                current_thread_was_attached = false;
+                if (java_vm_functions
+                    .AttachCurrentThreadAsDaemon
+                    .unwrap_unchecked())(
+                    java_vm, env.as_mut_ptr(), ptr::null_mut()
+                ) != jni_sys::JNI_OK
+                {
+                    panic!("failed to attach the current thread to the Java VM");
+                }
+            }
+
+            // Dropping MidiDevice requires the current thread to be attached to the Java VM.
+            ManuallyDrop::drop(&mut self.midi_device);
+
+            // Releasing MidiDevice is complete; if the current thread was not attached to the VM,
+            // detach the current thread.
+            if !current_thread_was_attached {
+                (java_vm_functions.DetachCurrentThread.unwrap_unchecked())(java_vm);
+            }
+        }
+    }
+}
+
+/// A thread-safe wrapper over [`MidiDevice`].
+pub struct MidiDevice {
+    guard: Arc<MidiDeviceGuard>,
+}
+
+impl MidiDevice {
+    /// Assumes ownership of `ptr`
+    ///
+    /// # Safety
+    /// `env` and `ptr` must be valid pointers to a [`jni_sys::JNIEnv`] instance and an Android
+    /// [`ffi::AMidiDevice`].
+    pub unsafe fn from_ptr(env: *mut jni_sys::JNIEnv, ptr: NonNull<ffi::AMidiDevice>) -> Self {
+        Self::from_unsafe(env, UnsafeMidiDevice::from_ptr(ptr))
+    }
+
+    /// Connects a native Midi Device object to the associated Java MidiDevice object.
+    ///
+    /// Use the returned [`MidiDevice`] to access the rest of the native MIDI API.
+    ///
+    /// # Safety
+    /// `env` and `midi_device_obj` must be valid pointers to a [`jni_sys::JNIEnv`] instance and a
+    /// Java [`MidiDevice`](https://developer.android.com/reference/android/media/midi/MidiDevice)
+    /// instance.
+    pub unsafe fn from_java(
+        env: *mut jni_sys::JNIEnv,
+        midi_device_obj: jni_sys::jobject,
+    ) -> Result<Self> {
+        Ok(Self::from_unsafe(
+            env,
+            UnsafeMidiDevice::from_java(env, midi_device_obj)?,
+        ))
+    }
+
+    /// Wraps the given unsafe [`MidiDevice`] instance into a safe counterpart.
+    ///
+    /// # Safety
+    ///
+    /// `env` must be a valid pointer to a [`jni_sys::JNIEnv`] instance.
+    pub unsafe fn from_unsafe(env: *mut jni_sys::JNIEnv, midi_device: UnsafeMidiDevice) -> Self {
+        let env_functions = env.as_mut().unwrap().as_ref().unwrap_unchecked();
+        let mut java_vm = MaybeUninit::uninit();
+        if (env_functions.GetJavaVM.unwrap_unchecked())(env, java_vm.as_mut_ptr())
+            != jni_sys::JNI_OK
+        {
+            panic!("failed to get the current Java VM");
+        }
+        let java_vm = NonNull::new_unchecked(java_vm.assume_init());
+
+        MidiDevice {
+            guard: Arc::new(MidiDeviceGuard {
+                midi_device: ManuallyDrop::new(midi_device),
+                java_vm,
+            }),
+        }
+    }
+
+    /// Gets the number of input (sending) ports available on this device.
+    pub fn num_input_ports(&self) -> Result<usize> {
+        self.guard.midi_device.num_input_ports()
+    }
+
+    /// Gets the number of output (receiving) ports available on this device.
+    pub fn num_output_ports(&self) -> Result<usize> {
+        self.guard.midi_device.num_output_ports()
+    }
+
+    /// Gets the MIDI device type of this device.
+    pub fn device_type(&self) -> Result<MidiDeviceType> {
+        self.guard.midi_device.device_type()
+    }
+
+    /// Opens the input port so that the client can send data to it.
+    pub fn open_input_port(&self, port_number: i32) -> Result<MidiInputPort> {
+        Ok(MidiInputPort {
+            // Convert the returned MidiInputPort<'_> into a MidiInputPort<'static>.
+            //
+            // SAFETY: the associated MIDI device of the input port will be alive during the
+            // lifetime of the returned MidiInputPort because it is hold by _device.
+            // Since Rust calls the destructor of fields in declaration order, the MIDI device
+            // will be alive even when the input port is being dropped.
+            inner: unsafe {
+                UnsafeMidiInputPort::from_ptr(self.guard.midi_device.open_input_port(port_number)?)
+            },
+            _guard: Arc::clone(&self.guard),
+        })
+    }
+
+    /// Opens the output port so that the client can receive data from it.
+    pub fn open_output_port(&self, port_number: i32) -> Result<MidiOutputPort> {
+        Ok(MidiOutputPort {
+            // Convert the returned MidiInputPort<'_> into a MidiInputPort<'static>.
+            //
+            // SAFETY: the associated MIDI device of the output port will be alive during the
+            // lifetime of the returned MidiOutputPort because it is hold by _device.
+            // Since Rust calls the destructor of fields in declaration order, the MIDI device
+            // will be alive even when the output port is being dropped.
+            inner: unsafe {
+                UnsafeMidiOutputPort::from_ptr(
+                    self.guard.midi_device.open_output_port(port_number)?,
+                )
+            },
+            _guard: Arc::clone(&self.guard),
+        })
+    }
+}
+
+impl fmt::Debug for MidiDevice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MidiInputPort")
-            .field("inner", &self.ptr)
+        f.debug_struct("MidiDevice")
+            .field("ptr", &self.guard.midi_device.ptr)
+            .field("java_vm", &self.guard.java_vm)
             .finish()
     }
 }
 
-impl<'a> MidiInputPort<'a> {
+/// A thin wrapper over [`ffi::AMidiInputPort`]. Please use [`MidiInputPort`] if you need the
+/// thread-safe version.
+#[derive(Debug)]
+pub struct UnsafeMidiInputPort {
+    ptr: NonNull<ffi::AMidiInputPort>,
+}
+
+impl UnsafeMidiInputPort {
     /// Assumes ownership of `ptr`
     ///
     /// # Safety
     /// `ptr` must be a valid pointer to an Android [`ffi::AMidiInputPort`].
     pub unsafe fn from_ptr(ptr: NonNull<ffi::AMidiInputPort>) -> Self {
-        Self {
-            ptr,
-            _marker: PhantomData,
-        }
+        Self { ptr }
     }
 
     pub fn ptr(&self) -> NonNull<ffi::AMidiInputPort> {
@@ -273,38 +426,58 @@ impl<'a> MidiInputPort<'a> {
     }
 }
 
-impl<'a> Drop for MidiInputPort<'a> {
+impl Drop for UnsafeMidiInputPort {
     fn drop(&mut self) {
         unsafe { ffi::AMidiInputPort_close(self.ptr.as_ptr()) };
     }
 }
 
-/// A wrapper over [`ffi::AMidiOutputPort`]. Note that [`MidiOutputPort`] is intentionally `!Send`
-/// and `!Sync`; please use [`safe::SafeMidiDevice::open_safe_output_port()`] if you need the
-/// thread-safe version.
-pub struct MidiOutputPort<'a> {
-    ptr: NonNull<ffi::AMidiOutputPort>,
-    _marker: PhantomData<&'a MidiDevice>,
+pub struct MidiInputPort {
+    inner: UnsafeMidiInputPort,
+    _guard: Arc<MidiDeviceGuard>,
 }
 
-impl<'a> fmt::Debug for MidiOutputPort<'a> {
+impl fmt::Debug for MidiInputPort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MidiOutputPort")
-            .field("inner", &self.ptr)
+        f.debug_struct("MidiInputPort")
+            .field("inner", &self.inner.ptr)
             .finish()
     }
 }
 
-impl<'a> MidiOutputPort<'a> {
+impl Deref for MidiInputPort {
+    type Target = UnsafeMidiInputPort;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+// SAFETY: a AMidi port is a mere holder of an atomic state, a pointer to the associated MIDI
+// device, a binder, and a file descriptor, all of which are safe to be sent to another thread.
+// https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/media/native/midi/amidi.cpp?q=symbol%3A%5CbAMIDI_Port%5Cb%20case%3Ayes
+unsafe impl Send for MidiInputPort {}
+
+// SAFETY: AMidiInputPort contains a file descriptor to a socket opened with the SOCK_SEQPACKET
+// mode, which preserves message boundaries so the receiver of a message always reads the whole
+// message.
+// https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/media/native/midi/amidi.cpp?q=symbol%3A%5CbAMIDI_PACKET_SIZE%5Cb%20case%3Ayes
+unsafe impl Sync for MidiInputPort {}
+
+/// A thin wrapper over [`ffi::AMidiOutputPort`]. Please use [`MidiOutputPort`] if you need the
+/// thread-safe version.
+#[derive(Debug)]
+pub struct UnsafeMidiOutputPort {
+    ptr: NonNull<ffi::AMidiOutputPort>,
+}
+
+impl UnsafeMidiOutputPort {
     /// Assumes ownership of `ptr`
     ///
     /// # Safety
     /// `ptr` must be a valid pointer to an Android [`ffi::AMidiOutputPort`].
     pub unsafe fn from_ptr(ptr: NonNull<ffi::AMidiOutputPort>) -> Self {
-        Self {
-            ptr,
-            _marker: PhantomData,
-        }
+        Self { ptr }
     }
 
     pub fn ptr(&self) -> NonNull<ffi::AMidiOutputPort> {
@@ -354,8 +527,39 @@ impl<'a> MidiOutputPort<'a> {
     }
 }
 
-impl<'a> Drop for MidiOutputPort<'a> {
+impl Drop for UnsafeMidiOutputPort {
     fn drop(&mut self) {
         unsafe { ffi::AMidiOutputPort_close(self.ptr.as_ptr()) };
     }
 }
+
+pub struct MidiOutputPort {
+    inner: UnsafeMidiOutputPort,
+    _guard: Arc<MidiDeviceGuard>,
+}
+
+impl fmt::Debug for MidiOutputPort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MidiOutputPort")
+            .field("inner", &self.inner.ptr)
+            .finish()
+    }
+}
+
+impl Deref for MidiOutputPort {
+    type Target = UnsafeMidiOutputPort;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+// SAFETY: a AMidi port is a mere holder of an atomic state, a pointer to the associated MIDI
+// device, a binder, and a file descriptor, all of which are safe to be sent to another thread.
+// https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/media/native/midi/amidi.cpp?q=symbol%3A%5CbAMIDI_Port%5Cb%20case%3Ayes
+unsafe impl Send for MidiOutputPort {}
+
+// SAFETY: AMidiOutputPort is guarded by a atomic state ([`AMIDI_Port::state`]), which enables
+// [`ffi::AMidiOutputPort_receive()`] to detect accesses from multiple threads and return error.
+// https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/media/native/midi/amidi.cpp?q=symbol%3A%5CbMidiReceiver%3A%3Areceive%5Cb%20case%3Ayes
+unsafe impl Sync for MidiOutputPort {}
